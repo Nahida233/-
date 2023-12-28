@@ -1,0 +1,173 @@
+#centos7是最小化安装  需手动开启网卡服务
+
+cd /etc/sysconfig/network-scripts
+ls  vi ensp01           //编辑网口配置文件
+
+ONBOOT        yes            //网卡服务自启      
+BOOTPROTO    static
+IPADDR
+NETMASK      255.255.255.0
+GATEWAY
+DNS1         223.5.5.5
+
+
+
+#更新依赖
+
+yum -y update  
+yum -y install gcc
+yum -y install wget
+
+
+
+#安装Perl 5
+cd /usr/local 
+wget https://www.cpan.org/src/5.0/perl-5.28.0.tar.gz
+tar -zxvf perl-5.28.0.tar.gz 
+cd perl-5.28.0
+./Configure -des -Dprefix=$HOME/localperl
+make
+make test
+make install
+
+
+
+#升级openssl
+wget https://github.com/openssl/openssl/archive/OpenSSL_1_1_1d.tar.gz
+tar -zxvf OpenSSL_1_1_1d.tar.gz
+cd  openssl-OpenSSL_1_1_1d
+./config --prefix=/usr/local/openssl // 指定安装路径
+make && make install
+mv /usr/bin/openssl /usr/bin/openssl.old
+mv /usr/lib64/openssl /usr/lib64/openssl.old
+mv /usr/lib64/libssl.so /usr/lib64/libssl.so.old   // 报错可忽略
+
+ln -s /usr/local/openssl/bin/openssl /usr/bin/openssl
+ln -s /usr/local/openssl/include/openssl /usr/include/openssl
+ln -s /usr/local/openssl/lib/libssl.so /usr/lib64/libssl.so
+echo "/usr/local/openssl/lib" >> /etc/ld.so.conf
+ldconfig
+
+openssl version   // 查看OpenSSL版本，已经升级为高版本
+
+
+
+#安装python
+wget https://www.python.org/ftp/python/3.11.5/Python-3.11.5.tgz
+tar -xzf Python-3.11.5.tgz 
+cd Python-3.11.5
+./configure --prefix=/usr/local/python3 --with-openssl=/usr/local/openssl
+make
+make install
+ln -s /usr/local/python3/bin/python3 /usr/bin/python3
+ln -s /usr/local/python3/bin/pip3 /usr/bin/pip3
+
+
+
+#安装pip3
+yum install --assumeyes python3-pip
+#安装抓包插件
+pip3 install scapy
+#安装依赖
+yum -y install libpcap-devel
+
+
+
+创建文件夹
+mkdir /data
+复制脚本 packet.py
+修改脚本网卡并运行测试   python3 packet.py
+检查日志输出 tail -f packet_info.log
+
+
+
+
+
+#packet.py脚本（注需要更改网口名称）
+
+from scapy.all import sniff, IP, TCP, UDP, Ether
+import logging.handlers
+
+log_file = "packet_info.log"
+max_log_size_bytes = 50 * 1024 * 1024  # 50MB
+# 创建设置日志的logger和handler
+logger = logging.getLogger("packet_logger")
+handler = logging.handlers.RotatingFileHandler(log_file, maxBytes=max_log_size_bytes, backupCount=100)
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+# 存储已处理的IP地址
+log_entry_old = ""
+# 存储已处理的IP地址
+processed_ips = set()
+def capture_packet(packet):
+    global log_entry_old
+    if packet.haslayer(IP) and packet.haslayer(Ether):
+        ip_layer = packet.getlayer(IP)
+        src_ip = ip_layer.src
+        # 进行去重判断
+        if src_ip in processed_ips:
+            return
+        processed_ips.add(src_ip)
+        dst_ip = ip_layer.dst
+        proto = ip_layer.proto
+        # 检查协议类型并提取端口信息
+        sport, dport = None, None
+        if proto == 6 and TCP in packet:
+            tcp_layer = packet.getlayer(TCP)
+            sport = tcp_layer.sport
+            dport = tcp_layer.dport
+        elif proto == 17 and UDP in packet:
+            udp_layer = packet.getlayer(UDP)
+            sport = udp_layer.sport
+            dport = udp_layer.dport
+        ether_layer = packet.getlayer(Ether)
+        src_mac = ether_layer.src
+        dst_mac = ether_layer.dst
+        log_entry = f"Source IP: {src_ip} Destination IP: {dst_ip} Protocol: {proto} Source Port: {sport} Destination Port: {dport} Source MAC: {src_mac} Destination MAC: {dst_mac}"
+        if log_entry == log_entry_old:
+            return
+        logger.info(log_entry)
+        log_entry_old = log_entry
+
+try:
+    interface = "enp5s0"
+    sniff(filter="ip", prn=capture_packet, iface=interface,store=0)
+except KeyboardInterrupt:
+    pass
+logger.handlers.clear()
+print(f"Packet information captured and written to '{log_file}'.")
+
+
+
+#设置脚本自启动
+
+yum install epel-release
+yum install -y supervisor
+systemctl enable supervisord   // 开机自启动
+systemctl start supervisord       //  启动supervisord服务
+systemctl status supervisord    // 查看supervisord服务状态
+ps -ef  |grep supervisord        //  查看是否存在supervisord进程
+
+配置文件路径/etc/supervisor/config.d
+
+vim /etc/supervisord.d/packet.ini
+[program:packet]
+directory = /data/
+command = /usr/bin/python3 /data/packet.py
+autostart = true     ; 在 supervisord 启动的时候也自动启动
+startsecs = 5        ; 启动 5 秒后没有异常退出，就当作已经正常启动了
+autorestart = true   ; 程序异常退出后自动重启
+startretries = 30     ; 启动失败自动重试次数，默认是 3
+user = root          ; 用哪个用户启动
+redirect_stderr = true  ; 把 stderr 重定向到 stdout，默认 false
+
+supervisorctl update  // 更新
+supervisorctl reload    // 重新载入supervisor，在这里相当于重启supervisor服务，里面的服务也会跟着重新启动
+
+
+
+#设置定时任务 每小时重启脚本
+ crontab -e
+0 * * * * /usr/bin/supervisorctl restart all
